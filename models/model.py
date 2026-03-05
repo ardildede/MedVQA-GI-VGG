@@ -1,72 +1,64 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torchvision.models as models
+from transformers import DistilBertModel
 
-class VGG_Attention_VQA(nn.Module):
-    def __init__(self, num_classes, vocab_size, embed_dim=512, hidden_dim=512):
-        super(VGG_Attention_VQA, self).__init__()
+class GatedFusion(nn.Module):
+    def __init__(self, input_dim):
+        super(GatedFusion, self).__init__()
+        # Hangi özelliğin daha önemli olduğunu seçen kapı katmanı
+        self.gate = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x1, x2):
+        # Özellikleri birleştir ve kapıdan geçir
+        combined = torch.cat((x1, x2), dim=1)
+        gate_values = self.gate(combined)
+        return combined * gate_values
+
+class VGG_BERT_Gated_VQA(nn.Module):
+    def __init__(self, num_classes):
+        super(VGG_BERT_Gated_VQA, self).__init__()
         
-        # 1. GÖRÜNTÜ: VGG19 (Spatial Features)
-        # VGG'nin sadece özellik çıkarıcı kısmını alıyoruz (FC katmanları yok)
-        # Çıktı: [Batch, 512, 7, 7] (224x224 resim için)
-        print("Model: VGG19 Yükleniyor...")
-        vgg = models.vgg19(pretrained=True)
-        self.features = vgg.features 
+        # 1. GÖRÜNTÜ: VGG16 (Pre-trained)
+        vgg = models.vgg16(pretrained=True)
+        self.vgg_features = vgg.features
+        self.vgg_avgpool = vgg.avgpool
+        # VGG çıktısını 768 boyuta indir (BERT ile eşitlemek için)
+        self.vgg_fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(512 * 7 * 7, 768),
+            nn.ReLU()
+        )
         
-        # 2. METİN: LSTM
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
+        # 2. METİN: DistilBERT
+        self.bert = DistilBertModel.from_pretrained('distilbert-base-uncased')
         
-        # 3. ATTENTION (DİKKAT) KATMANLARI
-        # Resimdeki her bölge (v) ve soru (q) için ortak bir uzay yaratıyoruz
-        self.v_proj = nn.Linear(512, hidden_dim) # Resmi projeksiyonla
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim) # Soruyu projeksiyonla
-        self.w_att = nn.Linear(hidden_dim, 1) # Puanla
+        # 3. FUSION: Gated Fusion (768 + 768 = 1536)
+        self.fusion = GatedFusion(input_dim=1536)
         
         # 4. SINIFLANDIRICI
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(hidden_dim, 256),
+            nn.Linear(1536, 512),
             nn.ReLU(),
-            nn.Linear(256, num_classes)
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
         )
 
-    def forward(self, images, questions):
-        # --- A. Resim Özellikleri ---
-        # [Batch, 512, 7, 7]
-        img_feat = self.features(images)
-        b, c, h, w = img_feat.size()
+    def forward(self, images, input_ids, attention_mask):
+        # Görüntü Özellikleri
+        img_x = self.vgg_features(images)
+        img_x = self.vgg_avgpool(img_x)
+        img_features = self.vgg_fc(img_x)
         
-        # Düzleştir: [Batch, 49, 512] (49 tane bölge)
-        img_feat = img_feat.view(b, c, -1).permute(0, 2, 1)
+        # Metin Özellikleri (BERT CLS Token)
+        bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        text_features = bert_out.last_hidden_state[:, 0, :] # [CLS] token
         
-        # --- B. Soru Özellikleri ---
-        embeds = self.embedding(questions)
-        # LSTM'den son gizli durumu (hidden state) al: [Batch, 512]
-        _, (hidden, _) = self.lstm(embeds)
-        ques_feat = hidden[-1]
+        # Gated Fusion
+        fused = self.fusion(img_features, text_features)
         
-        # --- C. DİKKAT MEKANİZMASI (ATTENTION) ---
-        # 1. Resimdeki 49 bölgeyi projeksiyonla: [Batch, 49, 512]
-        v_proj = self.v_proj(img_feat) 
-        
-        # 2. Soruyu 49 kere tekrarla (her bölgeyle kıyaslamak için): [Batch, 49, 512]
-        q_proj = self.q_proj(ques_feat).unsqueeze(1).expand_as(v_proj)
-        
-        # 3. Birleştir ve Tanh -> Linear -> Softmax
-        # Formül: alpha = softmax(w * tanh(v + q))
-        attention_scores = self.w_att(torch.tanh(v_proj + q_proj)) # [Batch, 49, 1]
-        alpha = F.softmax(attention_scores, dim=1) # Dikkat ağırlıkları (Nereye bakmalı?)
-        
-        # 4. Ağırlıklı Resim Vektörü
-        # Her bölgeyi kendi dikkat puanıyla çarpıp topluyoruz
-        # Polip olan yerin puanı yüksekse orası parlar.
-        weighted_img = (img_feat * alpha).sum(dim=1) # [Batch, 512]
-        
-        # --- D. Sınıflandırma ---
-        # Dikkatle seçilmiş resim bilgisi + Soru bilgisi
-        combined = weighted_img + ques_feat
-        output = self.classifier(combined)
-        
-        return output
+        # Sınıflandırma
+        return self.classifier(fused)
